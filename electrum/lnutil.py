@@ -1311,3 +1311,16 @@ class ChannelBlackList:
         BLACKLIST_DURATION = 3600
         now = int(time.time())
         return set(k for k, t in self.blacklist.items() if now - t < BLACKLIST_DURATION)
+
+
+def unique_hierarchy(hierarchy):
+    new_hierarchy = defaultdict(list)
+    for level, configs in hierarchy.items():
+        unique_configs = set()
+        for config in configs:
+            # config dict can be out of order
+            unique_configs.add(tuple((c, config[c]) for c in sorted(config.keys())))
+        for unique_config in unique_configs:
+            new_hierarchy[level].append(
+                {t[0]: t[1] for t in unique_config})
+    return new_hierarchy

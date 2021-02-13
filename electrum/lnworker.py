@@ -56,7 +56,8 @@ from .lnutil import (Outpoint, LNPeerAddr,
                      MIN_FINAL_CLTV_EXPIRY_FOR_INVOICE,
                      NUM_MAX_EDGES_IN_PAYMENT_PATH, SENT, RECEIVED, HTLCOwner,
                      UpdateAddHtlc, Direction, LnFeatures, ShortChannelID,
-                     HtlcLog, derive_payment_secret_from_payment_preimage)
+                     HtlcLog, derive_payment_secret_from_payment_preimage,
+                     unique_hierarchy)
 from .lnutil import ln_dummy_address, ln_compare_features, IncompatibleLightningFeatures
 from .transaction import PartialTxOutput, PartialTransaction, PartialTxInput
 from .lnonion import OnionFailureCode, process_onion_packet, OnionPacket, OnionRoutingFailure
@@ -86,7 +87,7 @@ SAVED_PR_STATUS = [PR_PAID, PR_UNPAID] # status that are persisted
 
 NUM_PEERS_TARGET = 4
 MPP_EXPIRY = 120
-
+MIN_SHARD_MSAT = 10_000_000
 
 FALLBACK_NODE_LIST_TESTNET = (
     LNPeerAddr(host='203.132.95.10', port=9735, pubkey=bfh('038863cf8ab91046230f561cd5b386cbff8309fa02e3f0c3ed161a3aeb64a643b9')),
@@ -987,14 +988,13 @@ class LNWallet(LNWorker):
         log = self.logs[key]
         return success, log
 
-
     async def pay_to_node(
             self, node_pubkey, payment_hash, payment_secret, amount_to_pay,
             min_cltv_expiry, r_tags, invoice_features, *, attempts: int = 1,
             full_path: LNPaymentPath = None):
 
         self.logs[payment_hash.hex()] = log = []
-        amount_inflight = 0 # what we sent in htlcs
+        amount_inflight = 0  # what we sent in htlcs
         while True:
             amount_to_send = amount_to_pay - amount_inflight
             if amount_to_send > 0:
@@ -1003,7 +1003,9 @@ class LNWallet(LNWorker):
                 # graph updates might occur during the computation
                 routes = await run_in_thread(partial(
                     self.create_routes_for_payment, amount_to_send, node_pubkey,
-                    min_cltv_expiry, r_tags, invoice_features, full_path=full_path))
+                    min_cltv_expiry, r_tags, invoice_features, shard_penalty=1.0, full_path=full_path))
+                if len(routes) > 1:
+                    raise NoPathFound  # mpp not yet supported
                 # 2. send htlcs
                 for route, amount_msat in routes:
                     await self.pay_to_route(route, amount_msat, payment_hash, payment_secret, min_cltv_expiry)
@@ -1151,6 +1153,71 @@ class LNWallet(LNWorker):
                 f"min_final_cltv_expiry: {addr.get_min_final_cltv_expiry()}"))
         return addr
 
+    def channels_with_funds(self):
+        # TODO: we can't spend down the full amount because we need to pay fees
+        fee_reserve_factor = 0.95
+        with self.lock:
+            channels = {}
+            for cid, chan in self._channels.items():
+                spend_amount = int(chan.available_to_spend(HTLCOwner.LOCAL) * fee_reserve_factor)
+                channels[cid] = spend_amount
+            return channels
+
+    def create_starting_split_hierarchy(self, amount_msat, channels_with_funds,
+                                        configs=30):
+        """Creates distribution of funds with least number of channels."""
+        split_hierarchy = defaultdict(list)
+        # shuffle to have different starting points
+        # TODO: find all possible starting configurations deterministically
+        for _ in range(configs):
+            channels_order = list(channels_with_funds.keys())
+            random.shuffle(channels_order)
+
+            configuration = {}
+            amount_added = 0
+            for c in channels_order:
+                s = channels_with_funds[c]
+                if amount_added == amount_msat:
+                    configuration[c] = 0
+                else:
+                    amount_to_add = amount_msat - amount_added
+                    amt = min(s, amount_to_add)
+                    configuration[c] = amt
+                    amount_added += amt
+            if amount_added != amount_msat:
+                raise ValueError(
+                    "Channels don't have enough sending capacity.")
+            number_nonzero_elements = len(
+                [c for c in configuration.values() if c != 0])
+            split_hierarchy[number_nonzero_elements].append(configuration)
+        return unique_hierarchy(split_hierarchy)
+
+    def suggest_splits(self, amount_msat, shard_penalty=1.0):
+        channels_with_funds = self.channels_with_funds()
+        split_hierarchy = self.create_starting_split_hierarchy(amount_msat, channels_with_funds)
+
+        # TODO: create more split configurations (in progress)
+
+        def rate_configuration(config, shard_penalty):
+            F = 0
+            amount = sum([v for v in config.values()])
+
+            for channel, value in config.items():
+                if value:
+                    value /= amount  # normalize
+                    F += value * value + shard_penalty * shard_penalty
+            return F
+
+        def rate_configurations(hierarchy, shard_penalty):
+            rated_configs = []
+            for level, configs in hierarchy.items():
+                for config in configs:
+                    rated_configs.append((config, rate_configuration(config, shard_penalty)))
+            sorted_rated_configs = sorted(rated_configs, key=lambda c: c[1], reverse=False)
+            return sorted_rated_configs
+
+        return rate_configurations(split_hierarchy, shard_penalty=shard_penalty)
+
     @profiler
     def create_routes_for_payment(
             self,
@@ -1159,11 +1226,64 @@ class LNWallet(LNWorker):
             min_cltv_expiry,
             r_tags,
             invoice_features,
-            *, full_path: LNPaymentPath = None) -> LNPaymentRoute:
-        # TODO: return multiples routes if we know that a single one will not work
-        # initially, try with less htlcs
+            shard_penalty: float,
+            *, full_path: LNPaymentPath = None) -> List[Tuple[LNPaymentRoute, int]]:
+        """Creates multiple routes for splitting of a payment over the available private channels.
+        The shard_penalty controls whether we prefer a low number
+        of shards (shard_penalty=1.0) or if we want to distribute the amount
+        as even as possible (shard_penalty=0.0) or something in between."""
+
+        # Create split configurations that are rated according to our
+        # preference (low rating=high preference).
+        split_configurations = self.suggest_splits(amount_msat, shard_penalty=shard_penalty)
+        self.logger.info("Created the following splitting configurations.")
+        for s in split_configurations:
+            self.logger.info(f"{s[0]} rating: {s[1]}")
+
+        # try to find a list of routes to complete a split
+        routes = []
+        for s in split_configurations:
+            try:
+                for chanid, part_amount_msat in s[0].items():
+                    if part_amount_msat:
+                        channel = self.channels[chanid]
+                        route = self.create_route_for_payment(
+                            part_amount_msat,
+                            invoice_pubkey,
+                            min_cltv_expiry,
+                            r_tags,
+                            invoice_features,
+                            channel,
+                            full_path=full_path
+                        )
+                        routes.append(route)
+                break  # we only need to have one successful path splitting
+            except NoPathFound:  # TODO: are these all outcomes?
+                routes = []
+                continue
+
+        if not routes:
+            raise NoPathFound
+        else:
+            return routes
+
+    def create_route_for_payment(
+            self,
+            amount_msat: int,
+            invoice_pubkey,
+            min_cltv_expiry,
+            r_tags,
+            invoice_features,
+            outgoing_channel: Channel = None,
+            *, full_path: Optional[LNPaymentPath]) -> Tuple[LNPaymentRoute, int]:
+
         route = None
-        channels = list(self.channels.values())
+        random.shuffle(r_tags)
+        # we can constrain the payment to a single outgoing channel
+        if outgoing_channel:
+            channels = [outgoing_channel]
+        else:
+            channels = list(self.channels.values())
         scid_to_my_channels = {chan.short_channel_id: chan for chan in channels
                                if chan.short_channel_id is not None}
         blacklist = self.network.channel_blacklist.get_current_list()
@@ -1237,8 +1357,8 @@ class LNWallet(LNWorker):
             raise LNPathInconsistent("last node_id != invoice pubkey")
         # add features from invoice
         route[-1].node_features |= invoice_features
-        # return a list of routes
-        return [(route, amount_msat)]
+
+        return route, amount_msat
 
     def add_request(self, amount_sat, message, expiry) -> str:
         coro = self._add_request_coro(amount_sat, message, expiry)
