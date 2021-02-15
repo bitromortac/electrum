@@ -1324,3 +1324,7 @@ def unique_hierarchy(hierarchy):
             new_hierarchy[level].append(
                 {t[0]: t[1] for t in unique_config})
     return new_hierarchy
+
+
+def number_nonzero_shards(configuration):
+    return len([v for v in configuration.values() if v])

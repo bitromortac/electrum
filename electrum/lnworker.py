@@ -57,7 +57,7 @@ from .lnutil import (Outpoint, LNPeerAddr,
                      NUM_MAX_EDGES_IN_PAYMENT_PATH, SENT, RECEIVED, HTLCOwner,
                      UpdateAddHtlc, Direction, LnFeatures, ShortChannelID,
                      HtlcLog, derive_payment_secret_from_payment_preimage,
-                     unique_hierarchy)
+                     unique_hierarchy, number_nonzero_shards)
 from .lnutil import ln_dummy_address, ln_compare_features, IncompatibleLightningFeatures
 from .transaction import PartialTxOutput, PartialTransaction, PartialTxInput
 from .lnonion import OnionFailureCode, process_onion_packet, OnionPacket, OnionRoutingFailure
@@ -1024,7 +1024,6 @@ class LNWallet(LNWorker):
             # if we get a channel update, we might retry the same route and amount
             self.handle_error_code_from_failed_htlc(htlc_log)
 
-
     async def pay_to_route(self, route: LNPaymentRoute, amount_msat:int, payment_hash:bytes, payment_secret:bytes, min_cltv_expiry:int):
         # send a single htlc
         short_channel_id = route[0].short_channel_id
@@ -1153,8 +1152,11 @@ class LNWallet(LNWorker):
                 f"min_final_cltv_expiry: {addr.get_min_final_cltv_expiry()}"))
         return addr
 
-    def channels_with_funds(self):
-        # TODO: we can't spend down the full amount because we need to pay fees
+    def channels_with_funds(self) -> Dict[bytes, int]:
+        """Determines a dict of channels (keyed by channel id in bytes) that
+        maps to their spendable amounts."""
+        # we can't spend down the full amount because we need to pay routing
+        # fees which we can't know beforehand, so keep a reserve
         fee_reserve_factor = 0.95
         with self.lock:
             channels = {}
@@ -1163,8 +1165,7 @@ class LNWallet(LNWorker):
                 channels[cid] = spend_amount
             return channels
 
-    def create_starting_split_hierarchy(self, amount_msat, channels_with_funds,
-                                        configs=30):
+    def create_starting_split_hierarchy(self, amount_msat, channels_with_funds, configs=30):
         """Creates distribution of funds with least number of channels."""
         split_hierarchy = defaultdict(list)
         # shuffle to have different starting points
@@ -1192,13 +1193,106 @@ class LNWallet(LNWorker):
             split_hierarchy[number_nonzero_elements].append(configuration)
         return unique_hierarchy(split_hierarchy)
 
-    def suggest_splits(self, amount_msat, shard_penalty=1.0):
-        channels_with_funds = self.channels_with_funds()
-        split_hierarchy = self.create_starting_split_hierarchy(amount_msat, channels_with_funds)
+    def propose_new_configuration(self, channels_with_funds, configuration,
+                                  amount_msat, preserve_number_shards=True):
+        # there are four basic operations to reach all states:
+        def redistribute(config: dict):
+            # we redistribute the amount of already selected channels
+            redistribution_amount = amount_msat // 10
+            nonzero = [ck for ck, cv in config.items() if
+                       cv >= redistribution_amount]
+            # zero = [ck for ck, cv in configuration.items() if cv == 0]
+            if len(nonzero) == 1:  # we only have a single channel, so we can't redistribute
+                return config
 
-        # TODO: create more split configurations (in progress)
+            channel_from = random.choice(nonzero)
+            channel_to = random.choice(nonzero)
+            if channel_from == channel_to:
+                return config
+            proposed_balance_from = config[
+                                        channel_from] - redistribution_amount
+            proposed_balance_to = config[channel_to] + redistribution_amount
+            if (
+                    proposed_balance_from < MIN_SHARD_MSAT or
+                    proposed_balance_to < MIN_SHARD_MSAT or
+                    proposed_balance_to > channels_with_funds[channel_to] or
+                    proposed_balance_from > channels_with_funds[channel_from]
+            ):
+                return config
+            else:
+                config[channel_from] = proposed_balance_from
+                config[channel_to] = proposed_balance_to
+            assert sum([cv for cv in config.values()]) == amount_msat
+            return config
 
-        def rate_configuration(config, shard_penalty):
+        def split(config: dict):
+            # we split the amount sent from a channel to another channel
+            nonzero = [ck for ck, cv in config.items() if cv != 0]
+            zero = [ck for ck, cv in config.items() if cv == 0]
+            try:
+                channel_from = random.choice(nonzero)
+                channel_to = random.choice(zero)
+            except IndexError:
+                return config
+            delta = config[channel_from] // 10
+            proposed_balance_from = config[channel_from] - delta
+            proposed_balance_to = config[channel_to] + delta
+            if (
+                    proposed_balance_from < MIN_SHARD_MSAT or
+                    proposed_balance_to < MIN_SHARD_MSAT or
+                    proposed_balance_to > channels_with_funds[channel_to] or
+                    proposed_balance_from > channels_with_funds[channel_from]
+            ):
+                return config
+            else:
+                config[channel_from] = proposed_balance_from
+                config[channel_to] = proposed_balance_to
+                assert sum([cv for cv in config.values()]) == amount_msat
+            return config
+
+        def swap(config: dict):
+            # we swap the amounts from a single channel with another channel
+            nonzero = [ck for ck, cv in config.items() if cv != 0]
+            all = list(config.keys())
+
+            channel_from = random.choice(nonzero)
+            channel_to = random.choice(all)
+
+            proposed_balance_to = config[channel_from]
+            proposed_balance_from = config[channel_to]
+            if (
+                    proposed_balance_from < MIN_SHARD_MSAT or
+                    proposed_balance_to < MIN_SHARD_MSAT or
+                    proposed_balance_to > channels_with_funds[channel_to] or
+                    proposed_balance_from > channels_with_funds[channel_from]
+            ):
+                return config
+            else:
+                config[channel_to] = proposed_balance_to
+                config[channel_from] = proposed_balance_from
+            return config
+
+        initial_number_shards = number_nonzero_shards(configuration)
+
+        REDISTRIBUTE = 5
+        for _ in range(REDISTRIBUTE):
+            configuration = redistribute(configuration)
+        if not preserve_number_shards and number_nonzero_shards(
+                configuration) == initial_number_shards:
+            configuration = split(configuration)
+        configuration = swap(configuration)
+
+        return configuration
+
+    @profiler
+    def suggest_splits(self, amount_msat: int, shard_penalty=1.0) -> List:
+        def rate_configuration(config: dict, shard_penalty: float) -> float:
+            """Defines an objective function to rate a split configuration.
+
+            We calculate the normalized L2 norm for a split configuration and
+            add a shard penalty for each nonzero amount. The consequence is that
+            amounts that are equally distributed and have less shards are rated
+            lowest."""
             F = 0
             amount = sum([v for v in config.values()])
 
@@ -1208,7 +1302,7 @@ class LNWallet(LNWorker):
                     F += value * value + shard_penalty * shard_penalty
             return F
 
-        def rate_configurations(hierarchy, shard_penalty):
+        def rated_sorted_configurations(hierarchy: dict, shard_penalty: float) -> List[Tuple]:
             rated_configs = []
             for level, configs in hierarchy.items():
                 for config in configs:
@@ -1216,7 +1310,42 @@ class LNWallet(LNWorker):
             sorted_rated_configs = sorted(rated_configs, key=lambda c: c[1], reverse=False)
             return sorted_rated_configs
 
-        return rate_configurations(split_hierarchy, shard_penalty=shard_penalty)
+        channels_with_funds = self.channels_with_funds()
+
+        # create initial guesses
+        split_hierarchy = self.create_starting_split_hierarchy(amount_msat, channels_with_funds)
+
+        # randomize initial guesses
+        CANDIDATES_PER_LEVEL = 20
+        MAX_SHARDS = 5
+        # generate splittings of different split levels up to number of channels
+        for level in range(2, min(MAX_SHARDS, len(self.channels) + 1)):
+            # generate a set of random configurations for each level
+            for _ in range(CANDIDATES_PER_LEVEL):
+                configurations = unique_hierarchy(split_hierarchy).get(level, None)
+                if configurations:  # we have a splitting of the desired number of shards
+                    configuration = random.choice(configurations)
+                    # generate new splittings preserving the number of shards
+                    configuration = self.propose_new_configuration(
+                        channels_with_funds, configuration, amount_msat,
+                        preserve_number_shards=True)
+                else:
+                    # go one level lower and look for valid splittings,
+                    # try to go one level higher by splitting a single outgoing amount
+                    configurations = unique_hierarchy(split_hierarchy).get(level - 1, None)
+                    if not configurations:
+                        raise ValueError(
+                            "No more configurations can be found")
+                    configuration = random.choice(configurations)
+                    # generate new splittings going one level higher in the number of shards
+                    configuration = self.propose_new_configuration(
+                        channels_with_funds, configuration, amount_msat,
+                        preserve_number_shards=False)
+
+                # add the newly found configuration (doesn't matter if nothing changed)
+                split_hierarchy[number_nonzero_shards(configuration)].append(configuration)
+
+        return rated_sorted_configurations(split_hierarchy, shard_penalty=shard_penalty)
 
     @profiler
     def create_routes_for_payment(
