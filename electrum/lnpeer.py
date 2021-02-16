@@ -1187,7 +1187,7 @@ class Peer(Logger):
         sig_64, htlc_sigs = chan.sign_next_commitment()
         self.send_message("commitment_signed", channel_id=chan.channel_id, signature=sig_64, num_htlcs=len(htlc_sigs), htlc_signature=b"".join(htlc_sigs))
 
-    def pay(self, *, route: 'LNPaymentRoute', chan: Channel, amount_msat: int,
+    def pay(self, *, route: 'LNPaymentRoute', chan: Channel, amount_msat: int, total_msat: int,
             payment_hash: bytes, min_final_cltv_expiry: int, payment_secret: bytes = None) -> UpdateAddHtlc:
         assert amount_msat > 0, "amount_msat is not greater zero"
         assert len(route) > 0
@@ -1198,8 +1198,13 @@ class Peer(Logger):
         local_height = self.network.get_local_height()
         # create onion packet
         final_cltv = local_height + min_final_cltv_expiry
-        hops_data, amount_msat, cltv = calc_hops_data_for_payment(route, amount_msat, final_cltv,
-                                                                  payment_secret=payment_secret)
+        hops_data, amount_msat, cltv = calc_hops_data_for_payment(
+            route,
+            amount_msat,
+            total_msat,
+            final_cltv,
+            payment_secret=payment_secret
+        )
         assert final_cltv <= cltv, (final_cltv, cltv)
         secret_key = os.urandom(32)
         onion = new_onion_packet([x.node_id for x in route], secret_key, hops_data, associated_data=payment_hash)

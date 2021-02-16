@@ -999,16 +999,17 @@ class LNWallet(LNWorker):
             amount_to_send = amount_to_pay - amount_inflight
             if amount_to_send > 0:
                 # 1. create a set of routes for remaining amount.
-                # note: path-finding runs in a separate thread so that we don't block the asyncio loop
-                # graph updates might occur during the computation
+                # note: path-finding runs in a separate thread so that we don't
+                # block the asyncio loop, graph updates might occur during the
+                # computation
+                # TODO: adapt shard_penalty to number of shards and attempts
                 routes = await run_in_thread(partial(
                     self.create_routes_for_payment, amount_to_send, node_pubkey,
                     min_cltv_expiry, r_tags, invoice_features, shard_penalty=1.0, full_path=full_path))
-                if len(routes) > 1:
-                    raise NoPathFound  # mpp not yet supported
+                # TODO: check invoice for support of mpp
                 # 2. send htlcs
                 for route, amount_msat in routes:
-                    await self.pay_to_route(route, amount_msat, payment_hash, payment_secret, min_cltv_expiry)
+                    await self.pay_to_route(route, amount_msat, amount_to_pay, payment_hash, payment_secret, min_cltv_expiry)
                     amount_inflight += amount_msat
                 util.trigger_callback('invoice_status', self.wallet, payment_hash.hex())
             # 3. await a queue
@@ -1024,7 +1025,7 @@ class LNWallet(LNWorker):
             # if we get a channel update, we might retry the same route and amount
             self.handle_error_code_from_failed_htlc(htlc_log)
 
-    async def pay_to_route(self, route: LNPaymentRoute, amount_msat:int, payment_hash:bytes, payment_secret:bytes, min_cltv_expiry:int):
+    async def pay_to_route(self, route: LNPaymentRoute, amount_msat:int, total_msat: int, payment_hash:bytes, payment_secret:bytes, min_cltv_expiry:int):
         # send a single htlc
         short_channel_id = route[0].short_channel_id
         chan = self.get_channel_by_short_id(short_channel_id)
@@ -1036,6 +1037,7 @@ class LNWallet(LNWorker):
             route=route,
             chan=chan,
             amount_msat=amount_msat,
+            total_msat=total_msat,
             payment_hash=payment_hash,
             min_final_cltv_expiry=min_cltv_expiry,
             payment_secret=payment_secret)
