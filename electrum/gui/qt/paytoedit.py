@@ -167,7 +167,7 @@ class PayToEdit(CompletionTextEdit, ScanQRTextEdit, Logger):
             bolt11_invoice = maybe_extract_bolt11_invoice(data)
             if bolt11_invoice is not None:
                 try:
-                    self.win.parse_lightning_invoice(bolt11_invoice)
+                    self.win.set_ln_invoice(bolt11_invoice)
                 except LnDecodeException as e:
                     self.errors.append(PayToLineError(line_content=data, exc=e))
                 else:
